@@ -25,11 +25,21 @@ DB_PATH = "bot_database.db"
 
 EXCLUDED_PREFIXES = ["@bot", "@admin", "@moder", "Bot", "Admin", "[bot]"]
 
-# Глобальные настройки ивента
 event_settings = {
     "points": DEFAULT_POINTS,
     "custom_text": DEFAULT_TEXT
 }
+
+class GameState:
+    def __init__(self):
+        self.task = None
+        self.remaining = 0
+        self.total_duration = 0
+        self.last_message_time = 0
+        self.last_user = None
+        self.is_active = False
+
+active_games: Dict[int, GameState] = {}
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -52,19 +62,10 @@ async def save_game(chat_id: int, duration: int, prize: str, prize_type: str):
         """, (chat_id, duration, prize, prize_type))
         await db.commit()
 
-async def get_game(chat_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT * FROM active_games WHERE chat_id = ? AND is_active = 1", (chat_id,))
-        return await cursor.fetchone()
-
-async def end_game(chat_id: int):
+async def end_game_db(chat_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE active_games SET is_active = 0 WHERE chat_id = ?", (chat_id,))
         await db.commit()
-
-async def is_game_active(chat_id: int) -> bool:
-    game = await get_game(chat_id)
-    return game is not None
 
 def has_excluded_prefix(name: str) -> bool:
     if not name:
@@ -127,53 +128,74 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
-active_timers: Dict[int, asyncio.Task] = {}
 user_data = {}
-last_message_info: Dict[int, tuple] = {}
 
-async def game_timer(chat_id: int, duration: int, prize: str, prize_type: str):
+async def reset_timer(chat_id: int, prize: str):
+    """Сбрасывает таймер на полную длительность"""
+    if chat_id not in active_games:
+        return
+    
+    game = active_games[chat_id]
+    
+    if game.task and not game.task.done():
+        game.task.cancel()
+    
+    game.remaining = game.total_duration
+    game.task = asyncio.create_task(game_countdown(chat_id, prize))
+
+async def game_countdown(chat_id: int, prize: str):
+    """Обратный отсчёт с уведомлениями каждые 25 секунд"""
+    game = active_games[chat_id]
+    
     try:
-        points = event_settings['points']
-        custom_text = event_settings['custom_text'].format(points=points)
-        
-        await bot.send_message(
-            chat_id,
-            f"""
-ИВЕНТ НАЧАЛСЯ
-
-{custom_text}
-Длительность: {duration} сек
-Пишите любые сообщения
-
-ПОЕХАЛИ
-"""
-        )
-        
-        remaining = duration
-        while remaining > 0:
-            await asyncio.sleep(min(25, remaining))
-            remaining -= 25
+        while game.remaining > 0 and game.is_active:
+            await asyncio.sleep(min(25, game.remaining))
+            game.remaining -= 25
             
-            if remaining > 0:
+            if game.remaining > 0 and game.is_active:
                 last_user = "никто"
-                if chat_id in last_message_info:
-                    user_id, username = last_message_info[chat_id]
-                    last_user = f"@{username}" if username else f"id{user_id}"
+                if game.last_user:
+                    last_user = f"@{game.last_user}" if game.last_user else "никто"
                 
                 await bot.send_message(
                     chat_id,
                     f"""
 ⏰ Ивент скоро завершится!
-Осталось: {remaining} сек
+Осталось: {game.remaining} сек
 Последнее сообщение от: {last_user}
 """
                 )
         
-        await end_game(chat_id)
-        
-        await bot.send_message(
-            chat_id,
-            f"""
+        if game.is_active:
+            await end_game(chat_id, prize)
+            
+    except asyncio.CancelledError:
+        pass
+
+async def start_game_timer(chat_id: int, duration: int, prize: str):
+    """Запускает игру с начальным таймером"""
+    game = active_games[chat_id]
+    game.total_duration = duration
+    game.remaining = duration
+    game.is_active = True
+    
+    if game.task and not game.task.done():
+        game.task.cancel()
+    
+    game.task = asyncio.create_task(game_countdown(chat_id, prize))
+
+async def end_game(chat_id: int, prize: str):
+    """Завершает игру"""
+    if chat_id in active_games:
+        active_games[chat_id].is_active = False
+        if active_games[chat_id].task:
+            active_games[chat_id].task.cancel()
+    
+    await end_game_db(chat_id)
+    
+    await bot.send_message(
+        chat_id,
+        f"""
 ИВЕНТ ЗАВЕРШЁН
 
 Время вышло
@@ -182,11 +204,7 @@ async def game_timer(chat_id: int, duration: int, prize: str, prize_type: str):
 
 Победителя выберет @{ADMIN_USERNAME}
 """
-        )
-            
-    except asyncio.CancelledError:
-        await end_game(chat_id)
-        await bot.send_message(chat_id, "Ивент остановлен")
+    )
 
 async def cmd_start(message: types.Message):
     if message.chat.type == "private":
@@ -240,15 +258,14 @@ async def process_points(message: types.Message, state: FSMContext):
 async def settings_text(callback: types.CallbackQuery):
     await callback.message.edit_text(
         f"Текущий текст:\n{event_settings['custom_text']}\n\n"
-        "Введите новый текст. Используйте {points} для подстановки очков.\n"
-        "Пример: Каждое сообщение = {points} звёзд"
+        "Введите новый текст. Используйте {points} для подстановки очков."
     )
     await SettingsStates.waiting_for_text.set()
     await callback.answer()
 
 async def process_text(message: types.Message, state: FSMContext):
     event_settings['custom_text'] = message.text
-    await message.reply(f"Текст установлен:\n{message.text}")
+    await message.reply(f"Текст установлен")
     await state.finish()
     await message.reply("Панель управления", reply_markup=get_admin_menu())
 
@@ -309,7 +326,7 @@ async def process_prize_type(callback: types.CallbackQuery, state: FSMContext):
         return
     
     messages = {
-        'stars': "Отправьте количество звёзд (например 100)",
+        'stars': "Отправьте количество звёзд",
         'nft': "Отправьте ссылку на NFT",
         'link': "Отправьте ссылку или описание"
     }
@@ -382,21 +399,21 @@ async def launch_in_group(callback: types.CallbackQuery):
     
     await save_game(chat_id, duration, prize, prize_type)
     
-    if chat_id in active_timers:
-        active_timers[chat_id].cancel()
-    
-    task = asyncio.create_task(game_timer(chat_id, duration, prize, prize_type))
-    active_timers[chat_id] = task
+    active_games[chat_id] = GameState()
+    await start_game_timer(chat_id, duration, prize)
     
     try:
         points = event_settings['points']
+        custom_text = event_settings['custom_text'].format(points=points)
+        
         await bot.send_message(
             chat_id,
             f"""
 АДМИН @{ADMIN_USERNAME} ЗАПУСТИЛ ИВЕНТ
 
-{points} звёзд за сообщение
+{custom_text}
 {duration} секунд
+Таймер сбрасывается после каждого сообщения!
 
 ПОЕХАЛИ
 """
@@ -421,10 +438,10 @@ async def list_active_events(callback: types.CallbackQuery):
     text = "Активные ивенты\n\n"
     has_active = False
     
-    for chat_id, timer in active_timers.items():
-        if not timer.done():
+    for chat_id, game in active_games.items():
+        if game.is_active:
             has_active = True
-            text += f"Группа {chat_id}\n"
+            text += f"Группа {chat_id} - осталось {game.remaining} сек\n"
     
     if not has_active:
         text += "Нет активных ивентов"
@@ -445,14 +462,22 @@ async def close_menu(callback: types.CallbackQuery):
     await callback.answer()
 
 async def on_group_message(message: types.Message):
-    if not await is_game_active(message.chat.id):
+    chat_id = message.chat.id
+    
+    if chat_id not in active_games or not active_games[chat_id].is_active:
         return
     
     user_name = message.from_user.username or message.from_user.first_name or ""
     if has_excluded_prefix(user_name):
         return
     
-    last_message_info[message.chat.id] = (message.from_user.id, message.from_user.username)
+    game = active_games[chat_id]
+    game.last_user = message.from_user.username or message.from_user.first_name
+    
+    prize_data = user_data.get(message.from_user.id, {})
+    prize = prize_data.get('prize', 'Не указан')
+    
+    await reset_timer(chat_id, prize)
 
 async def cmd_id(message: types.Message):
     await message.reply(f"ID группы: {message.chat.id}")
@@ -461,9 +486,12 @@ async def cmd_stop(message: types.Message):
     if message.from_user.id != ADMIN_ID and message.from_user.username != ADMIN_USERNAME:
         return
     
-    if message.chat.id in active_timers:
-        active_timers[message.chat.id].cancel()
-        del active_timers[message.chat.id]
+    chat_id = message.chat.id
+    if chat_id in active_games:
+        active_games[chat_id].is_active = False
+        if active_games[chat_id].task:
+            active_games[chat_id].task.cancel()
+        await end_game_db(chat_id)
         await message.reply("Ивент остановлен")
 
 def register_handlers():
@@ -505,8 +533,9 @@ async def on_startup(dp):
     logging.info("Бот запущен")
 
 async def on_shutdown(dp):
-    for task in active_timers.values():
-        task.cancel()
+    for game in active_games.values():
+        if game.task:
+            game.task.cancel()
     await bot.close()
 
 if __name__ == '__main__':
