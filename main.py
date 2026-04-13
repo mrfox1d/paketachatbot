@@ -14,8 +14,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BOT_TOKEN = os.getenv("TOKEN")
-ADMIN_USERNAME = "pitardasman"
-ADMIN_ID = 5349009098
+ADMIN_USERNAME = "walletgitler"
+ADMIN_ID = 5907622429
 
 DEFAULT_DURATION = 90
 DB_PATH = "bot_database.db"
@@ -145,6 +145,8 @@ async def game_timer(chat_id: int, duration: int, prize: str, prize_type: str):
         await bot.send_message(chat_id, "Ивент остановлен")
 
 async def cmd_start(message: types.Message):
+    logging.info(f"Получена команда /start от {message.from_user.id} (@{message.from_user.username})")
+    
     if message.chat.type == "private":
         if message.from_user.id == ADMIN_ID or message.from_user.username == ADMIN_USERNAME:
             await message.reply(f"Привет, админ @{ADMIN_USERNAME}\n/admin - управление")
@@ -152,6 +154,8 @@ async def cmd_start(message: types.Message):
             await message.reply("Привет\nБот для ивентов в группах")
 
 async def cmd_admin(message: types.Message):
+    logging.info(f"Получена команда /admin от {message.from_user.id} (@{message.from_user.username})")
+    
     if message.from_user.id != ADMIN_ID and message.from_user.username != ADMIN_USERNAME:
         await message.reply("Нет прав")
         return
@@ -395,10 +399,15 @@ def register_handlers():
 async def on_startup(dp):
     await init_db()
     
+    # Удаляем вебхук перед запуском поллинга
+    await bot.delete_webhook(drop_pending_updates=True)
+    
     try:
         await bot.send_message(ADMIN_ID, "Бот запущен\n/admin - управление")
-    except:
-        pass
+    except Exception as e:
+        logging.error(f"Не удалось отправить сообщение админу: {e}")
+    
+    logging.info("Бот запущен и готов к работе")
 
 async def on_shutdown(dp):
     for task in active_timers.values():
@@ -407,6 +416,6 @@ async def on_shutdown(dp):
 
 if __name__ == '__main__':
     register_handlers()
-    executor.start_polling(dp, on_startup=on_startup, on_shutdown=on_shutdown, skip_updates=True)
+    executor.start_polling(dp, on_startup=on_startup, on_shutdown=on_shutdown)
 
-# сделано @pitardasman
+# сделано @walletgitler
