@@ -19,9 +19,17 @@ ADMIN_USERNAME = "walletgitler"
 ADMIN_ID = 5907622429
 
 DEFAULT_DURATION = 90
+DEFAULT_POINTS = 19
+DEFAULT_TEXT = "1 сообщение = {points} звёзд"
 DB_PATH = "bot_database.db"
 
 EXCLUDED_PREFIXES = ["@bot", "@admin", "@moder", "Bot", "Admin", "[bot]"]
+
+# Глобальные настройки ивента
+event_settings = {
+    "points": DEFAULT_POINTS,
+    "custom_text": DEFAULT_TEXT
+}
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -71,7 +79,15 @@ def get_admin_menu():
     return InlineKeyboardMarkup(row_width=1).add(
         InlineKeyboardButton("Создать ивент", callback_data="admin:create"),
         InlineKeyboardButton("Активные ивенты", callback_data="admin:list"),
+        InlineKeyboardButton("Настройки", callback_data="admin:settings"),
         InlineKeyboardButton("Закрыть", callback_data="admin:close")
+    )
+
+def get_settings_menu():
+    return InlineKeyboardMarkup(row_width=1).add(
+        InlineKeyboardButton(f"Очки за сообщение: {event_settings['points']}", callback_data="settings:points"),
+        InlineKeyboardButton("Текст сообщения", callback_data="settings:text"),
+        InlineKeyboardButton("Назад", callback_data="back:main")
     )
 
 def get_duration_keyboard():
@@ -103,21 +119,29 @@ class EventCreation(StatesGroup):
     waiting_for_prize = State()
     waiting_for_group = State()
 
+class SettingsStates(StatesGroup):
+    waiting_for_points = State()
+    waiting_for_text = State()
+
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 active_timers: Dict[int, asyncio.Task] = {}
 user_data = {}
+last_message_info: Dict[int, tuple] = {}
 
 async def game_timer(chat_id: int, duration: int, prize: str, prize_type: str):
     try:
+        points = event_settings['points']
+        custom_text = event_settings['custom_text'].format(points=points)
+        
         await bot.send_message(
             chat_id,
             f"""
 ИВЕНТ НАЧАЛСЯ
 
-1 сообщение = 19 звёзд
+{custom_text}
 Длительность: {duration} сек
 Пишите любые сообщения
 
@@ -125,7 +149,26 @@ async def game_timer(chat_id: int, duration: int, prize: str, prize_type: str):
 """
         )
         
-        await asyncio.sleep(duration)
+        remaining = duration
+        while remaining > 0:
+            await asyncio.sleep(min(25, remaining))
+            remaining -= 25
+            
+            if remaining > 0:
+                last_user = "никто"
+                if chat_id in last_message_info:
+                    user_id, username = last_message_info[chat_id]
+                    last_user = f"@{username}" if username else f"id{user_id}"
+                
+                await bot.send_message(
+                    chat_id,
+                    f"""
+⏰ Ивент скоро завершится!
+Осталось: {remaining} сек
+Последнее сообщение от: {last_user}
+"""
+                )
+        
         await end_game(chat_id)
         
         await bot.send_message(
@@ -161,6 +204,53 @@ async def cmd_admin(message: types.Message):
         "Панель управления",
         reply_markup=get_admin_menu()
     )
+
+async def settings_menu(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID and callback.from_user.username != ADMIN_USERNAME:
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        "Настройки ивента",
+        reply_markup=get_settings_menu()
+    )
+    await callback.answer()
+
+async def settings_points(callback: types.CallbackQuery):
+    await callback.message.edit_text(
+        f"Текущее значение: {event_settings['points']}\n\nВведите новое количество очков за сообщение:"
+    )
+    await SettingsStates.waiting_for_points.set()
+    await callback.answer()
+
+async def process_points(message: types.Message, state: FSMContext):
+    try:
+        points = int(message.text)
+        if points > 0:
+            event_settings['points'] = points
+            await message.reply(f"Очки за сообщение установлены: {points}")
+        else:
+            await message.reply("Число должно быть больше 0")
+    except ValueError:
+        await message.reply("Введите число")
+    
+    await state.finish()
+    await message.reply("Панель управления", reply_markup=get_admin_menu())
+
+async def settings_text(callback: types.CallbackQuery):
+    await callback.message.edit_text(
+        f"Текущий текст:\n{event_settings['custom_text']}\n\n"
+        "Введите новый текст. Используйте {points} для подстановки очков.\n"
+        "Пример: Каждое сообщение = {points} звёзд"
+    )
+    await SettingsStates.waiting_for_text.set()
+    await callback.answer()
+
+async def process_text(message: types.Message, state: FSMContext):
+    event_settings['custom_text'] = message.text
+    await message.reply(f"Текст установлен:\n{message.text}")
+    await state.finish()
+    await message.reply("Панель управления", reply_markup=get_admin_menu())
 
 async def create_event(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID and callback.from_user.username != ADMIN_USERNAME:
@@ -270,6 +360,7 @@ async def process_group_id(message: types.Message, state: FSMContext):
 Группа: {chat_id}
 Длительность: {data['duration']} сек
 Приз: {data['prize']}
+Очки: {event_settings['points']}
 """,
             reply_markup=get_launch_keyboard(chat_id)
         )
@@ -298,12 +389,13 @@ async def launch_in_group(callback: types.CallbackQuery):
     active_timers[chat_id] = task
     
     try:
+        points = event_settings['points']
         await bot.send_message(
             chat_id,
             f"""
 АДМИН @{ADMIN_USERNAME} ЗАПУСТИЛ ИВЕНТ
 
-19 звёзд за сообщение
+{points} звёзд за сообщение
 {duration} секунд
 
 ПОЕХАЛИ
@@ -359,6 +451,8 @@ async def on_group_message(message: types.Message):
     user_name = message.from_user.username or message.from_user.first_name or ""
     if has_excluded_prefix(user_name):
         return
+    
+    last_message_info[message.chat.id] = (message.from_user.id, message.from_user.username)
 
 async def cmd_id(message: types.Message):
     await message.reply(f"ID группы: {message.chat.id}")
@@ -378,8 +472,14 @@ def register_handlers():
     
     dp.register_callback_query_handler(create_event, text="admin:create")
     dp.register_callback_query_handler(list_active_events, text="admin:list")
+    dp.register_callback_query_handler(settings_menu, text="admin:settings")
     dp.register_callback_query_handler(close_menu, text="admin:close")
     dp.register_callback_query_handler(back_to_main, text_startswith="back:", state="*")
+    
+    dp.register_callback_query_handler(settings_points, text="settings:points")
+    dp.register_callback_query_handler(settings_text, text="settings:text")
+    dp.register_message_handler(process_points, state=SettingsStates.waiting_for_points)
+    dp.register_message_handler(process_text, state=SettingsStates.waiting_for_text)
     
     dp.register_callback_query_handler(process_duration, text_startswith="dur:", state=EventCreation.waiting_for_duration)
     dp.register_message_handler(process_custom_duration, state=EventCreation.waiting_for_duration)
